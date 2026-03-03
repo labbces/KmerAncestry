@@ -6,10 +6,6 @@ import time
 import threading
 from tqdm import tqdm
 
-# Configurações de Acesso
-USER = "srruser"
-PASS = "@LFCCX*CfDc3"
-BASE_URL = "https://labbces.cena.usp.br/sra_datasets/"
 
 # Amostras
 SRR_SAMPLES = {

@@ -1,0 +1,1522 @@
+#!/bin/bash
+# =============================================================================
+#  KaMcEs - K-Mer Ancestry pipeline
+#
+#  Um driver para todos os estagios. Cada subcomando monta o manifesto e
+#  submete o array; nenhum caminho e digitado aqui, tudo vem do config.sh.
+#
+#    ./kamces setup         # 0. instala as dependencias Python em py_pkgs
+#
+#  O pipeline, em tres estagios:
+#    ./kamces catalogs-ms   # 1. catalogos por especie (baixa, esboca, apaga)
+#    ./kamces sliding       # 2. janela deslizante -> Parquet de similaridades
+#    ./kamces plots         # 3. graficos por cromossomo
+#    ./kamces all           # 1-3 encadeados com -hold_jid
+#
+#  DOIS EIXOS, e as quatro combinacoes tem pastas separadas:
+#   1) QUAIS CATALOGOS sao a referencia   (sliding, plots, pintura, hist, refs)
+#        --normal   {especie}                  completos
+#        --uniform  {especie}_uniformizado     profundidade = spontaneum
+#        --all      os dois  (padrao)
+#   2) QUAIS CROMOSSOMOS sao a consulta   (sliding, plots, pintura)
+#        --genomas principal   os hibridos do GENOME_DIR  (padrao)
+#        --genomas validacao   os cromossomos de officinarum e spontaneum,
+#                              de identidade conhecida - a conferencia do
+#                              metodo, onde a resposta ja se sabe
+#        --genomas ambos       os dois
+#
+#  Catalogos:
+#    ./kamces catalogs-ms --inventario  # so mostra o que falta, nao submete
+#    ./kamces catalogs-ms --detalhe     # combinacao a combinacao, com caminhos
+#    ./kamces catalogs-ms --reparar     # varre os zips, apaga o que quebrou e
+#                          # refaz so o scaled mais fino que faltar
+#    ./kamces catalogs-ms --so-merge --all --uniforme
+#                          # --all: catalogo com todos os acessos
+#                          # --uniforme: subconjunto de profundidade
+#                          #   equivalente a spontaneum, sufixo _uniformizado
+#
+#  Graficos:
+#    ./kamces sliding --genomas validacao --sample 2   # 2 cromossomos, teste
+#    ./kamces plots --sample Chr01_Hap1   # so esse cromossomo
+#    ./kamces plots --sample 3            # os 3 primeiros, para ver como ficou
+#    ./kamces plots --metricas contencao --escalas log2
+#    ./kamces pintura       # quem ganha em cada janela (--sample tambem vale)
+#    ./kamces hist          # espectro de k-mers dos catalogos (formato KAT).
+#                          # Vai a fila (--local roda numa sessao interativa)
+#    ./kamces hist --grades validacao,uniformizado
+#    ./kamces hist --sample 2             # so os 2 primeiros catalogos
+#    ./kamces hist --sample officinarum,robustum
+#    ./kamces hist --so-plot              # reusa o hist_kmers.tsv, so redesenha
+#    HIST_YMAX=3e5 ./kamces hist --so-plot   # corta o eixo y e redesenha
+#
+#  Manutencao:
+#    ./kamces refazer       # confere TODAS as arvores do sliding, apaga o
+#                          # que quebrou e re-submete so o que falta. Roda
+#                          # como job. --varrer so relata; --sem-apagar nao
+#                          # apaga; --estados restringe (AUSENTE, CURTO, ...)
+#    ./kamces refs          # o sliding acha as assinaturas de referencia?
+#    ./kamces doctor        # que python/modulos cada estagio enxerga
+#    ./kamces status        # o que ja existe e o que falta
+#    ./kamces limpar        # apaga CSV perdido, so se o .parquet ja existir
+#    ./kamces clean-parts   # remove partes orfas de jobs abortados
+#    ./kamces bench         # rede, descompressao ou sketch: quem come o tempo?
+#    ./kamces bench-ms      # mede o manysketch e extrapola para o conjunto
+#    ./kamces --version     # qual build voce tem em maos
+# =============================================================================
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export KAMCES_LIB="$HERE/lib"
+export KAMCES_DIR="$HERE"
+. "$HERE/lib/common.sh"
+
+# MANIFEST_DIR ja vem do lib/common.sh (os .job tambem precisam dele).
+mkdir -p "$MANIFEST_DIR"
+
+c_bold=$'\033[1m'; c_dim=$'\033[2m'; c_off=$'\033[0m'
+say()  { echo "${c_bold}KaMcEs${c_off} $*"; }
+note() { echo "   ${c_dim}$*${c_off}"; }
+
+logdir_for() { local d="$LOGS/$1"; mkdir -p "$d"; echo "$d"; }
+
+# PRE-VOO DOS .R. Um erro de parse num .R nao aparece ao editar: aparece
+# depois do qsub, em todas as tarefas ao mesmo tempo. Custa milissegundos.
+pre_voo_r() {
+    python3 "$HERE/stages/checkr.py" "$@" >/dev/null 2>&1 && return 0
+    python3 "$HERE/stages/checkr.py" "$@" >&2
+    kamces_die "corrija o(s) .R acima antes de submeter"
+}
+
+# =========================== OS DOIS EIXOS =================================
+#
+# 1) QUAIS CATALOGOS servem de referencia
+#      --normal    {especie}                completos
+#      --uniform   {especie}_uniformizado   profundidade equivalente a spontaneum
+#      --all       os dois  (padrao)
+#
+# 2) QUAIS CROMOSSOMOS entram como consulta
+#      --genomas principal    os hibridos do GENOME_DIR  (padrao)
+#      --genomas validacao    os cromossomos de identidade CONHECIDA
+#                             (officinarum e spontaneum), para conferir se o
+#                             metodo acerta onde a resposta ja se sabe
+#      --genomas ambos        os dois
+#
+# As quatro combinacoes tem pastas separadas: sao experimentos diferentes e os
+# numeros nao se comparam entre si.
+
+# Eixo 1. Ecoa a lista, na ordem canonica.
+conjuntos_de() {
+    local n="" u=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --normal)  n=1 ;;
+            --uniform|--uniformizado) u=1 ;;
+            --all)     n=1; u=1 ;;
+        esac
+        shift
+    done
+    [ -z "$n$u" ] && { n=1; u=1; }       # sem flag = --all
+    printf '%s' "${n:+normal }${u:+uniform }"
+}
+
+# Eixo 2. O padrao e SO o principal: a validacao e uma conferencia pontual,
+# nao algo para dobrar o tamanho de toda submissao sem voce pedir.
+genomas_de() {
+    local escolha="principal"
+    while [ $# -gt 0 ]; do
+        if [ "$1" = "--genomas" ]; then
+            case "${2:-}" in
+                principal|principais) escolha="principal" ;;
+                validacao|valid)      escolha="validacao" ;;
+                ambos|todos|all)      escolha="principal validacao" ;;
+                *) kamces_die "--genomas aceita: principal, validacao ou ambos" ;;
+            esac
+        fi
+        shift
+    done
+    printf '%s' "$escolha"
+}
+
+# Tira as flags dos dois eixos de "$@", para o resto do parser nao tropecar.
+sem_flags_conjunto() {
+    local out=() pula=""
+    while [ $# -gt 0 ]; do
+        if [ -n "$pula" ]; then pula=""; shift; continue; fi
+        case "$1" in
+            --normal|--uniform|--uniformizado|--all) ;;
+            --genomas) pula=1 ;;
+            *) out+=("$1") ;;
+        esac
+        shift
+    done
+    # NADA quando sobrou nada. Um `printf '%s\n'` com array vazio imprime uma
+    # LINHA VAZIA, o mapfile de quem chama vira um elemento "" e esse ""
+    # chegava ao comando seguinte como argumento de verdade.
+    if [ "${#out[@]}" -gt 0 ]; then printf '%s\n' "${out[@]}"; fi
+    return 0
+}
+
+# Existe .sig para este rotulo em TODAS as combinacoes de k x scaled?
+_rotulo_completo() {
+    local rot="$1" k sc
+    for k in $KS; do for sc in $SCALEDS; do
+        [ -s "$CATALOGS_DIR/${rot}_${k}_scaled${sc}.sig" ] || return 1
+    done; done
+    return 0
+}
+
+# OS ROTULOS DE REFERENCIA, resolvidos contra o disco AGORA.
+#
+# Resolver aqui, e nao dentro do job, tem dois motivos: a lista fica visivel no
+# log da submissao, e vai congelada no instantaneo - o job nao depende de o
+# disco continuar igual quando a tarefa comecar.
+rotulos_de() {
+    local conj="$1" sp saida="" faltando=""
+    case "$conj" in
+        normal)
+            for sp in $SPECIES; do saida="${saida:+$saida,}$sp"; done ;;
+        uniform)
+            # spontaneum e a referencia de profundidade: ele NAO tem
+            # _uniformizado, e entra na sua unica versao. Isso e o desenho,
+            # nao uma falta.
+            for sp in $SPECIES; do
+                if _rotulo_completo "${sp}_uniformizado"; then
+                    saida="${saida:+$saida,}${sp}_uniformizado"
+                elif _rotulo_completo "$sp"; then
+                    saida="${saida:+$saida,}$sp"
+                else
+                    faltando="${faltando:+$faltando, }$sp"
+                fi
+            done ;;
+    esac
+    [ -n "$faltando" ] && note "conjunto $conj: sem catalogo para $faltando" >&2
+    printf '%s' "$saida"
+}
+
+# As pastas de cada combinacao (referencia x genomas).
+_sufixo_par() {   # $1 = conjunto   $2 = genomas
+    local s=""
+    [ "$2" = "validacao" ] && s="_valid"
+    [ "$1" = "uniform" ]   && s="${s}_uniformizado"
+    printf '%s' "$s"
+}
+indices_de() {
+    local base="$INDEXES_DIR" suf; suf="$(_sufixo_par "$1" "$2")"
+    case "$suf" in
+        "")                   printf '%s' "$INDEXES_DIR" ;;
+        _uniformizado)        printf '%s' "${INDEXES_UNIF_DIR:-${base}_uniformizado}" ;;
+        _valid)               printf '%s' "${INDEXES_VALID_DIR:-${base}_valid}" ;;
+        _valid_uniformizado)  printf '%s' "${INDEXES_VALID_UNIF_DIR:-${base}_valid_uniformizado}" ;;
+    esac
+}
+graficos_de() {
+    local base="$PLOTS_SIM_DIR" suf; suf="$(_sufixo_par "$1" "$2")"
+    case "$suf" in
+        "")                   printf '%s' "$PLOTS_SIM_DIR" ;;
+        _uniformizado)        printf '%s' "${PLOTS_UNIF_DIR:-${base}_uniformizado}" ;;
+        _valid)               printf '%s' "${PLOTS_VALID_DIR:-${base}_valid}" ;;
+        _valid_uniformizado)  printf '%s' "${PLOTS_VALID_UNIF_DIR:-${base}_valid_uniformizado}" ;;
+    esac
+}
+
+# OS FASTA DE UM EIXO 2, como linhas "rotulo<TAB>caminho".
+#
+# O rotulo vira PREFIXO do nome do cromossomo na saida. Sem ele, o Chr01 de
+# officinarum e o Chr01 de spontaneum - que existem os dois, com o mesmo
+# nome - cairiam na MESMA pasta e uma tarefa sobrescreveria a outra.
+# Os FASTA de uma pasta, pelos PADROES pedidos.
+#
+# A pasta do spontaneum tem, alem dos 10 cromossomos em .fa, um .fasta do
+# Chr01 e dois arquivos de outra nomenclatura (Cr01AD-sp.fa). Filtrar por
+# extensao pegava os quatro e o Chr01 colidia consigo mesmo. Com
+# GENOME_VALID_PADRAO="Chr*.fa" entram exatamente os 10 que interessam.
+_acha_fasta() {   # $1 = pasta   $2 = lista de padroes separados por espaco
+    local d="$1" pats="$2" expr=() pat primeiro=1
+    for pat in $pats; do
+        [ "$primeiro" = 1 ] && primeiro=0 || expr+=(-o)
+        expr+=(-iname "$pat")
+    done
+    [ "${#expr[@]}" -gt 0 ] || return 0
+    find "$d" -maxdepth 1 -type f \( "${expr[@]}" \) -print0 | sort -z
+}
+
+fastas_de() {
+    local genoma="$1" d rot par
+    local pad_princ="${GENOME_PADRAO:-*.fa *.fasta *.fa.gz *.fasta.gz}"
+    local pad_valid="${GENOME_VALID_PADRAO:-$pad_princ}"
+    if [ "$genoma" = "principal" ]; then
+        [ -d "$GENOME_DIR" ] || { note "GENOME_DIR nao existe: $GENOME_DIR" >&2; return 0; }
+        while IFS= read -r -d '' f; do printf '\t%s\n' "$f"; done \
+            < <(_acha_fasta "$GENOME_DIR" "$pad_princ")
+        return 0
+    fi
+    # validacao: pares rotulo:caminho no GENOME_VALID_DIRS
+    for par in ${GENOME_VALID_DIRS:-}; do
+        rot="${par%%:*}"; d="${par#*:}"
+        if [ "$rot" = "$d" ]; then
+            note "GENOME_VALID_DIRS: '$par' nao esta no formato rotulo:caminho" >&2
+            continue
+        fi
+        if [ ! -d "$d" ]; then note "genomas de validacao: $d nao existe" >&2; continue; fi
+        while IFS= read -r -d '' f; do printf '%s\t%s\n' "$rot" "$f"; done \
+            < <(_acha_fasta "$d" "$pad_valid")
+    done
+}
+
+# LISTA DE CROMOSSOMOS PARA UM ESTAGIO DE GRAFICO.
+#   $1 pasta de entrada   $2 pasta de saida   $3 manifesto   $4 valor do --sample
+#
+# O --sample aceita as duas formas que fazem sentido:
+#   --sample 3                 os 3 primeiros, em ordem alfabetica
+#   --sample Chr01_Hap1        so esse
+#   --sample Chr01_Hap1,Chr02_Hap1   esses dois
+# Vazio = todos. A ordem alfabetica e de proposito: "os 3 primeiros" tem que
+# dar os MESMOS 3 toda vez, senao nao da para comparar duas rodadas.
+# ACRESCENTA ao manifesto (nao trunca): com --all sao tres chamadas, uma por
+# conjunto. Quem chama e que zera o arquivo antes da primeira.
+monta_manifesto_parquet() {
+    local src="$1" dst="$2" m="$3" amostra="${4:-}" rot="${5:-}"
+    local todas=() d
+    while IFS= read -r -d '' d; do
+        if find "$d" -maxdepth 1 -type f -name '*.parquet' -print -quit | grep -q .; then
+            todas+=("$d")
+        fi
+    done < <(find "$src" -mindepth 1 -maxdepth 1 -type d -print0 | sort -z)
+    if [ "${#todas[@]}" -eq 0 ]; then
+        note "${rot:+$rot: }nenhuma pasta com .parquet em $src"
+        return 0
+    fi
+
+    local escolhidas=()
+    if [ -z "$amostra" ]; then
+        escolhidas=("${todas[@]}")
+    else
+        case "$amostra" in
+            ''|*[!0-9]*)
+                # nomes de cromossomo, separados por virgula ou espaco
+                local nome achou faltando=""
+                for nome in ${amostra//,/ }; do
+                    achou=""
+                    for d in "${todas[@]}"; do
+                        if [ "$(basename "$d")" = "$nome" ]; then
+                            escolhidas+=("$d"); achou=1; break
+                        fi
+                    done
+                    [ -n "$achou" ] || faltando="${faltando:+$faltando, }$nome"
+                done
+                if [ -n "$faltando" ]; then
+                    note "nao achei em $src: $faltando"
+                    note "existem ${#todas[@]}; os 5 primeiros:"
+                    for d in "${todas[@]:0:5}"; do note "  $(basename "$d")"; done
+                    kamces_die "--sample nao casou com essas pastas"
+                fi ;;
+            *)
+                [ "$amostra" -gt 0 ] || kamces_die "--sample precisa ser > 0"
+                local i=0
+                for d in "${todas[@]}"; do
+                    [ "$i" -ge "$amostra" ] && break
+                    escolhidas+=("$d"); i=$(( i + 1 ))
+                done ;;
+        esac
+    fi
+    for d in "${escolhidas[@]}"; do printf '%s\t%s\n' "$d" "$dst" >> "$m"; done
+    if [ -n "$amostra" ]; then
+        note "${rot:+$rot: }--sample: ${#escolhidas[@]} de ${#todas[@]} cromossomo(s)"
+    else
+        note "${rot:+$rot: }${#escolhidas[@]} cromossomo(s)"
+    fi
+}
+
+# PYTHON COM SOURMASH NO NO DE LOGIN.
+#
+# Os .job chamam kamces_require_python e por isso enxergam o sourmash; os
+# comandos que rodam AQUI (hist --local, derivar, bench) nao
+# chamavam nada, e o python3 pelado do no de login nao tem sourmash - o
+# sintoma era um "sourmash e necessario" seco, antes de ler qualquer arquivo.
+# Esta funcao carrega a mesma combinacao de modulos que os jobs usam, uma vez
+# por execucao. O `module` referencia variaveis nao definidas, entao vai
+# dentro do sem_set_u.
+_py_pronto=""
+py_local() {
+    [ -n "$_py_pronto" ] && return 0
+    # A sonda vai num SUBSHELL de proposito: o kamces_require_python termina
+    # com `exit 1` quando nao acha nada, e isso mataria o driver antes de a
+    # dica abaixo ser impressa. So depois de saber que da certo e que ele e
+    # chamado de verdade, aqui, onde o `module load` precisa valer.
+    if ! ( sem_set_u kamces_require_python "$@" ) >/dev/null 2>&1; then
+        kamces_die "nao achei neste no um python3 que importe: $*
+  Este comando roda AQUI, nao na fila. No no de login o modulo costuma nao
+  estar carregado. Saidas:
+    - abra uma sessao interativa (qlogin) e rode de novo; ou
+    - ./kamces doctor   para ver o que cada estagio enxerga; ou
+    - ./kamces setup    para instalar as dependencias em \$PY_PKGS."
+    fi
+    _py_pronto=1
+    sem_set_u kamces_require_python "$@" >&2
+}
+
+# Recursos do qsub, montados uma vez a partir do config.
+#
+# H_VMEM VAZIO = nenhum limite e pedido. Isso e legitimo e as vezes ajuda:
+# h_vmem e RLIMIT_AS, ou seja, ESPACO DE ENDERECAMENTO VIRTUAL, nao memoria
+# residente. numpy, Arrow e sourmash reservam mapeamentos virtuais grandes que
+# nunca chegam a ser tocados; um job pode bater no h_vmem usando uma fracao
+# daquilo de RAM de verdade. E exatamente essa a cara do
+# "ArrowMemoryError: malloc of size N failed".
+#
+# O preco de nao pedir nada: o SGE deixa de ter como espacar os jobs pelos
+# nos, e quem mata passa a ser o OOM killer do Linux - SIGKILL seco, sem
+# traceback, exit 137. Por isso existe o MEM_FREE: ele nao limita o processo,
+# so informa ao escalonador quanta RAM o job precisa encontrar livre.
+QSUB_L=()
+_l=""
+[ -n "${H_VMEM:-}" ]   && _l="${_l:+$_l,}h_vmem=$H_VMEM"
+[ -n "${MEM_FREE:-}" ] && _l="${_l:+$_l,}mem_free=$MEM_FREE"
+[ -n "${H_RT:-}" ]     && _l="${_l:+$_l,}h_rt=$H_RT"
+[ -n "$_l" ] && QSUB_L=(-l "$_l")
+unset _l
+
+# 'module' e uma funcao de shell gerada pelo /etc/profile.d/modules.sh e
+# referencia variaveis que podem estar indefinidas. Este driver roda sob
+# 'set -euo pipefail', entao chamar module (ou quem chama module) direto daqui
+# derruba o script com "unbound variable". Nos .job isso nao acontece porque la
+# o carregamento vem ANTES do set -u. Aqui desligamos por um instante.
+sem_set_u() {
+    local rc=0
+    set +eu
+    "$@" || rc=$?
+    set -eu
+    return $rc
+}
+
+# Submete um array e devolve o job id puro.
+# Diz uma vez, por execucao, o que esta sendo pedido a fila. Sem isso, "tirei
+# o h_vmem" e uma alteracao invisivel no log.
+_recursos_ditos=""
+diz_recursos() {
+    [ -n "$_recursos_ditos" ] && return 0
+    _recursos_ditos=1
+    # >&2 OBRIGATORIO: o submit() tem a saida capturada por $( ), e qualquer
+    # coisa impressa aqui vira parte do "job id". Foi exatamente isso que
+    # quebrou o encadeamento do reparo: o -hold_jid recebeu o texto do aviso
+    # junto do numero, o SGE tratou aquilo como NOME de job, nao achou nenhum
+    # com esse nome, e simplesmente nao segurou nada - as quatro fases
+    # dispararam juntas, sem um unico erro no log.
+    if [ ${#QSUB_L[@]} -eq 0 ]; then
+        note "recursos: nenhum limite pedido a fila (sem h_vmem/mem_free/h_rt)" >&2
+    else
+        note "recursos: ${QSUB_L[1]}" >&2
+    fi
+}
+
+# Um id de job e so digitos. Qualquer outra coisa aqui significa que a saida
+# do qsub veio contaminada - e um -hold_jid com lixo dentro NAO da erro: o SGE
+# interpreta como nome de job, nao encontra, e segue sem segurar.
+jid_ok() {
+    local j="$1" onde="$2"
+    case "$j" in
+        ""|*[!0-9]*)
+            kamces_die "id de job invalido vindo de $onde: '$j'
+  Isso costuma ser saida de texto capturada junto com o numero.
+  NAO submeta o encadeamento assim: os -hold_jid nao seguram nada." ;;
+    esac
+}
+
+# O submit() roda dentro de $( ) - um SUBSHELL. Variavel atribuida la dentro
+# nao chega aqui, entao o caminho do instantaneo e publicado em ARQUIVO. Um
+# `ULTIMO_SNAP=...` dentro do submit compilaria, rodaria, e deixaria os jobs
+# encadeados apontando para "/stages/x.job".
+TC_ESTAGIO=""    # -tc especifico de um estagio; vazio = MAX_JOBS
+ULTIMO_SNAP_ARQ="$MANIFEST_DIR/.ultimo_instantaneo"
+ultimo_snap() {
+    local d=""
+    [ -f "$ULTIMO_SNAP_ARQ" ] && d="$(cat "$ULTIMO_SNAP_ARQ")"
+    [ -n "$d" ] && [ -d "$d" ] || kamces_die \
+        "nao achei o instantaneo da submissao anterior ($ULTIMO_SNAP_ARQ).
+  Os jobs encadeados precisam dele. Isto e um bug - reporte."
+    printf '%s\n' "$d"
+}
+
+# INSTANTANEO DA SUBMISSAO.
+#
+# O que o job recebe do qsub sao CAMINHOS - do config.sh, do manifesto, da
+# lib - e ele le esses arquivos quando a TAREFA COMECA, nao quando voce
+# submete. Com -tc 8 e um array de 48, as ultimas tarefas comecam horas
+# depois. Sem congelar nada, tres coisas davam errado em silencio:
+#
+#   1. editar o config.sh no meio faria metade do array rodar com um KS e a
+#      outra metade com outro;
+#   2. submeter o mesmo estagio de novo sobrescreve o manifesto - que tem
+#      caminho fixo por estagio - e o array anterior passaria a ler as linhas
+#      do novo, pegando a especie errada;
+#   3. instalar uma versao nova do KaMcEs por cima trocaria o .job e o .py
+#      debaixo das tarefas que ainda nao comecaram.
+#
+# Por isso cada submissao copia config + manifesto + lib + stages para uma
+# pasta datada e aponta o qsub para LA. Depois disso o array e imune: voce
+# pode editar o config, resubmeter e ate reinstalar o pacote sem tocar no que
+# ja esta na fila. Custa ~1 MB por submissao.
+instantaneo() {
+    local name="$1" manifest="$2"
+    local snap="$MANIFEST_DIR/instantaneos/${name}.$(date +%Y%m%d-%H%M%S).$$"
+    mkdir -p "$snap"
+    cp    "$KAMCES_CONFIG" "$snap/config.sh"
+    [ -n "$manifest" ] && [ -f "$manifest" ] && cp "$manifest" "$snap/manifest.tsv"
+    cp -r "$HERE/lib"      "$snap/lib"
+    cp -r "$HERE/stages"   "$snap/stages"
+    # Guarda tambem os manifestos auxiliares do estagio (o reparar usa lista de
+    # bloqueados e um segundo manifesto), para o instantaneo ficar completo.
+    local aux
+    for aux in "$MANIFEST_DIR"/reparar_*.tsv "$MANIFEST_DIR"/reparar_*.txt; do
+        [ -f "$aux" ] && cp "$aux" "$snap/" 2>/dev/null || true
+    done
+    printf '%s\n' "$snap"
+}
+
+# Mantem so os 40 instantaneos mais recentes.
+poda_instantaneos() {
+    local base="$MANIFEST_DIR/instantaneos"
+    [ -d "$base" ] || return 0
+    local velhos
+    velhos=$(ls -1dt "$base"/*/ 2>/dev/null | tail -n +41 || true)
+    [ -n "$velhos" ] && printf '%s\n' "$velhos" | xargs -r rm -rf || true
+}
+
+# As variaveis que apontam um job para um instantaneo. Os qsub que nao passam
+# pelo submit() (pintura, hist, o merge do catalogs-ms) usam
+# isto para ficar congelados do mesmo jeito.
+env_do_snap() {
+    printf 'CONFIG_FILE=%s/config.sh,KAMCES_LIB=%s/lib,KAMCES_DIR=%s,STAGES=%s/stages' \
+           "$1" "$1" "$1" "$1"
+}
+
+submit() {
+    local name="$1" tasks="$2" manifest="$3"; shift 3
+    diz_recursos
+    local ld; ld="$(logdir_for "$name")"
+    local extra=("$@")
+    local snap; snap="$(instantaneo "$name" "$manifest")"
+    printf '%s\n' "$snap" > "$ULTIMO_SNAP_ARQ"   # ver ultimo_snap(): subshell
+    # >&2 OBRIGATORIO, pelo mesmo motivo do diz_recursos: a saida do submit()
+    # e capturada por $( ) e vira o job id. Um `note` em stdout aqui contamina
+    # o id, e um -hold_jid com lixo dentro NAO da erro - so nao segura nada.
+    note "instantaneo: $snap" >&2
+    poda_instantaneos
+    # ${arr[@]+"${arr[@]}"}: em bash < 4.4 (CentOS 7) um "${arr[@]}" vazio
+    # dispara "unbound variable" sob set -u.
+    qsub -terse -N "kamces_$name" -q "$QUEUE" ${QSUB_L[@]+"${QSUB_L[@]}"} \
+         -o "$ld" -e "$ld" -t 1-"$tasks" -tc "${TC_ESTAGIO:-$MAX_JOBS}" \
+         -v MANIFEST="$snap/manifest.tsv",KAMCES_LISTA="$snap/manifest.tsv",KAMCES_LISTA_LINHAS="$(wc -l < "$snap/manifest.tsv" | tr -d ' ')",CONFIG_FILE="$snap/config.sh",KAMCES_LIB="$snap/lib",KAMCES_DIR="$snap",STAGES="$snap/stages" \
+         ${extra[@]+"${extra[@]}"} "$snap/stages/$name.job" | head -1 | cut -d. -f1
+}
+
+# -------------------------------------------------------------------- setup --
+cmd_setup() {
+    say "instalando dependencias Python em $PY_PKGS"
+    env KAMCES_LIB="$KAMCES_LIB" CONFIG_FILE="$KAMCES_CONFIG" \
+        bash "$HERE/stages/setup.sh" "$@"
+}
+
+
+
+# --------------------------------------------------------------------- hist --
+# Espectro de abundancia de k-mers dos catalogos, grade k x scaled.
+cmd_hist() {
+    # --sample escolhe QUANTOS (ou QUAIS) catalogos entram - abrir os .sig e a
+    # parte cara. --grades escolhe quais das tres figuras sair.
+    local grades="${HIST_GRADES:-}" amostra="" local_="" so_plot=""
+    # As MESMAS flags de referencia dos outros comandos. No hist elas escolhem
+    # qual das duas grades sair. O eixo 2 (--genomas) nao se aplica: o hist
+    # plota CATALOGOS, nao cromossomos.
+    local conjs; conjs="$(conjuntos_de "$@")"
+    local args; mapfile -t args < <(sem_flags_conjunto "$@")
+    set -- ${args[@]+"${args[@]}"}
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --grades) grades="${2:-}"
+                      [ $# -ge 2 ] && shift 2 || shift ;;
+            --sample) amostra="${2:-}"
+                      [ $# -ge 2 ] && shift 2 || shift ;;
+            --local)   local_=1; shift ;;
+            --so-plot|--replot) so_plot=1; shift ;;
+            *) kamces_die "opcao desconhecida em hist: $1
+  uso: ./kamces hist [--normal|--uniform|--all] [--sample N|nomes]
+                     [--so-plot] [--local]" ;;
+        esac
+    done
+    # --grades continua valendo e tem precedencia; sem ele, as flags de
+    # conjunto viram grades.
+    if [ -z "$grades" ]; then
+        local g="" c
+        for c in $conjs; do
+            case "$c" in
+                normal)  g="${g:+$g,}especies" ;;
+                uniform) g="${g:+$g,}uniformizado" ;;
+            esac
+        done
+        grades="$g"
+    fi
+    # Pasta propria: a tabela nao entra no meio dos .sig e as figuras nao se
+    # misturam com os graficos por cromossomo.
+    pre_voo_r "$HERE/stages/hist_kmers.R"
+    local hdir="${HIST_DIR:-$DATA/hist}"
+    # O --sample muda o CONTEUDO da tabela, entao ele entra no nome dela e no
+    # das figuras. Sem isso, uma rodada com --sample sobrescreveria a tabela
+    # completa e o --so-plot seguinte desenharia o subconjunto sem avisar.
+    local sufa=""
+    if [ -n "$amostra" ]; then
+        sufa="_sample$(printf '%s' "$amostra" | tr -cd 'A-Za-z0-9,_' | tr ',' '-')"
+    fi
+    local tsv="$hdir/hist_kmers${sufa}.tsv"
+    local png="$hdir/hist_kmers${sufa}.png"
+    mkdir -p "$hdir"
+    say "espectro de k-mers dos catalogos em $CATALOGS_DIR"
+    note "eixos lineares, no formato do KAT (HIST_ESCALA=log volta ao log10;"
+    note "  HIST_XMAX / HIST_YMAX mandam nos limites na mao)"
+    note "saem duas figuras (4 especies / 4 especies uniformizadas)"
+    [ -n "$amostra" ] && note "sample: $amostra"
+    [ -n "$grades" ]  && note "grades: $grades"
+
+    # PADRAO: VAI PARA A FILA. O Python abre catalogos de dezenas de milhoes
+    # de hashes e o R desenha figuras grandes - nenhum dos dois e servico de
+    # no de login, onde alias o modulo do sourmash nem costuma estar
+    # carregado. O --local existe para uma sessao interativa (qlogin).
+    if [ -n "$so_plot" ]; then
+        [ -s "$tsv" ] || kamces_die "--so-plot: $tsv nao existe ou esta vazio.
+  Rode o hist sem --so-plot uma vez para gerar a tabela."
+        note "--so-plot: reaproveitando a tabela ($(wc -l < "$tsv") linhas)"
+    fi
+    if [ -n "$local_" ]; then
+        if [ -z "$so_plot" ]; then
+            py_local sourmash
+            note "--local: rodando aqui mesmo, sem passar pela fila"
+            python3 "$HERE/stages/hist_kmers.py" --catalogs-dir "$CATALOGS_DIR" \
+                --saida "$tsv" --ks "$KS" --scaled "$SCALEDS" \
+                ${amostra:+--sample "$amostra"} || return 1
+        fi
+        note "tabela: $tsv"
+        HIST_GRADES="$grades" Rscript --vanilla "$HERE/stages/hist_kmers.R" "$tsv" "$png"
+        return $?
+    fi
+    note "saida: $hdir"
+    note "tabela: $(basename "$tsv")"
+    note "figuras: $(basename "${png%.png}")_{especies,uniformizado}[_parametros].png"
+    local m="$MANIFEST_DIR/hist.tsv"
+    printf '%s\t%s\t%s\n' "$CATALOGS_DIR" "$png" "$tsv" > "$m"
+    local jid; jid=$(submit hist 1 "$m" \
+        -v HIST_SAMPLE="$amostra",HIST_GRADES="$grades",HIST_SO_PLOT="$so_plot",HIST_ESCALA="${HIST_ESCALA:-}",HIST_XMAX="${HIST_XMAX:-}",HIST_YMAX="${HIST_YMAX:-}",HIST_ERRO_ATE="${HIST_ERRO_ATE:-}")
+    jid_ok "$jid" "hist"
+    note "job $jid (1 tarefa); log em $(logdir_for hist)"
+}
+
+# ----------------------------------------------------------------- bench-ms --
+# Mede o manysketch num pedaco de um FASTQ real e extrapola para o conjunto.
+# Um processo, um core, apaga o que baixou: pode rodar com outro job na fila.
+cmd_bench_ms() {
+    : "${SRA_PASSWORD:?exporte SRA_PASSWORD antes (o bench le um FASTQ real)}"
+    py_local sourmash
+    python3 "$HERE/stages/bench_ms.py" \
+        --username "$SRA_USER" --password "$SRA_PASSWORD" \
+        --ks "$KS" --scaled "$SCALEDS" --todas-especies "$SPECIES" "$@"
+}
+
+# --------------------------------------------------- catalogs-ms --reparar --
+# Varre a pasta de zips por acesso e conserta o que ficou para tras: zips que
+# nunca apareceram, zips de 0 byte e temporarios ".{...}.parcial.zip" de
+# corridas mortas.
+#
+# A ORDEM IMPORTA, e e o ponto todo deste comando:
+#
+#   FASE 1  garantir o SCALED MAIS FINO de todo acesso. So ele exige reler o
+#           FASTQ - a parte cara, horas por acesso. Vai para a fila com
+#           SCALEDS_FORCA, para nao baixar nada por causa dos grossos.
+#   FASE 2  DERIVAR 100, 200 e 500 do 50, por downsample. Um sketch scaled=50
+#           guarda os hashes < MAX/50; o pedaco dele abaixo de MAX/200 e,
+#           exatamente, o scaled=200. Nao ha rede, nao ha FASTQ.
+#
+# A fase 2 espera a fase 1 por -hold_jid. Se nao houver pendencia nenhuma na
+# fase 1, a fase 2 e submetida sozinha.
+cmd_catalogs_ms_reparar() {
+    local zips="${CATALOGS_MS_ZIPS:-$CATALOGS_DIR/zips_por_acesso}"
+    local pend="$MANIFEST_DIR/reparo_pendentes.tsv"
+    local pend_ac="$MANIFEST_DIR/reparo_pendentes.txt"
+    local mm="$MANIFEST_DIR/reparo_especies.tsv"
+    [ -d "$zips" ] || kamces_die "pasta de zips nao existe: $zips"
+
+    local fino; fino=$(printf '%s\n' $SCALEDS | sort -n | head -1)
+    local grossos; grossos=$(printf '%s\n' $SCALEDS | sort -n | tail -n +2 | tr '\n' ' ')
+
+    # O QUE PRECISA EXISTIR POR ACESSO. Com a derivacao feita depois do merge,
+    # so o scaled mais fino precisa estar em zip por acesso; os grossos saem
+    # do catalogo fundido. Com MS_TODOS_SCALED=1 o antigo volta, e ai a fase 2
+    # (downsample zip a zip) tem serventia de novo.
+    local escalas="$fino"
+    [ -n "${MS_TODOS_SCALED:-}" ] && escalas="$SCALEDS"
+    say "reparo dos zips por acesso em $zips"
+    if [ -n "${MS_TODOS_SCALED:-}" ]; then
+        note "fase 1: garantir scaled=$fino (le FASTQ)   fase 2: derivar {${grossos% }}"
+    else
+        note "confere e refaz o scaled=$fino de cada acesso; os grossos {${grossos% }}"
+        note "saem do catalogo fundido, no ./kamces catalogs-ms --so-merge"
+    fi
+    # A varredura roda AQUI, no no de login: e so stat() de arquivo, custa nada,
+    # e o resultado precisa estar em maos para montar o array.
+    python3 "$HERE/stages/reparar_zips.py" --zips-dir "$zips" \
+        --species $SPECIES --ks $KS --scaled $escalas \
+        --varrer --pendentes "$pend" || kamces_die "a varredura falhou"
+
+    # `grep -c .` de arquivo vazio IMPRIME "0" e ainda devolve 1: com um
+    # `|| echo 0` a variavel virava "0\n0" e o teste numerico estourava com
+    # "integer expression expected". O wc -l sempre sai numero e sempre da 0.
+    local n; n=$(wc -l < "$pend" 2>/dev/null || echo 0); n="${n//[^0-9]/}"; n="${n:-0}"
+    cut -f2 "$pend" > "$pend_ac" 2>/dev/null || : > "$pend_ac"
+    : > "$mm"; for sp in $SPECIES; do printf '%s\n' "$sp" >> "$mm"; done
+    local nm; nm=$(wc -l < "$mm"); nm="${nm//[^0-9]/}"; nm="${nm:-0}"
+    [ "$nm" -gt 0 ] || kamces_die "SPECIES esta vazio no config.sh"
+
+    local espera=""
+    if [ "$n" -gt 0 ]; then
+        [ -n "${SRA_PASSWORD:-}" ] || kamces_die \
+            "$n acesso(s) precisam voltar para o manysketch, e isso baixa FASTQ.
+  Exporte SRA_PASSWORD antes (export SRA_PASSWORD='...')."
+        local teto="${TETO_DISCO_GB:-1000}"
+        local tc; tc=$(python3 "$HERE/stages/planejar_disco.py" \
+            --teto-gb "$teto" --folga "${FOLGA_DISCO:-1.3}" \
+            --pendentes "$pend_ac" --maximo "$MAX_JOBS" 2>/tmp/kamces_disco.$$ || echo 1)
+        sed 's/^/   /' "/tmp/kamces_disco.$$" >&2 2>/dev/null || true
+        rm -f "/tmp/kamces_disco.$$"
+        case "$tc" in ''|*[!0-9]*) tc=1 ;; esac
+        TC_ESTAGIO="$tc"
+        note "fase 1: $n acesso(s) pendente(s), ate $tc ao mesmo tempo (teto ${teto} GB)"
+        # SCALEDS_FORCA restringe o job ao scaled fino; MODO_REPARO faz ele
+        # ignorar o .sig final da especie, que existe mas foi montado sem estes
+        # acessos - sem isso a tarefa sairia dizendo "ja existe, nada a fazer".
+        local jid1; jid1=$(submit catalogs_ms "$n" "$pend" \
+            -v SRA_PASSWORD="$SRA_PASSWORD",MS_THREADS="${MS_THREADS:-}",TETO_DISCO_GB="$teto",SCALEDS_FORCA="$fino",MODO_REPARO=1,MS_TODOS_SCALED="${MS_TODOS_SCALED:-}" "$@")
+        jid_ok "$jid1" "catalogs_ms (reparo)"
+        note "fase 1: job $jid1"
+        espera="$jid1"
+        TC_ESTAGIO=""
+    else
+        note "fase 1: nenhum acesso pendente no scaled=$fino - nada a baixar"
+    fi
+
+    if [ -z "${grossos// /}" ] || [ -z "${MS_TODOS_SCALED:-}" ]; then
+        # Sem MS_TODOS_SCALED nao ha fase 2: os scaled grossos nao existem
+        # mais por acesso, saem do fundido.
+        note "pronto. Quando a fase 1 terminar, junte e derive com:"
+        note "  ./kamces catalogs-ms --so-merge --all --uniforme"
+        return 0
+    fi
+
+    local ldr; ldr="$(logdir_for reparar_zips)"
+    local snap=""
+    [ -n "$espera" ] && snap="$(ultimo_snap)"
+    if [ -z "$snap" ]; then
+        snap="$(instantaneo reparar_zips "$mm")"; poda_instantaneos
+        note "instantaneo: $snap"
+    fi
+    cp "$mm" "$snap/manifest_reparo.tsv"
+    local jid2; jid2=$(qsub -terse -N kamces_reparar_zips -q "$QUEUE" \
+        ${QSUB_L[@]+"${QSUB_L[@]}"} -o "$ldr" -e "$ldr" -t 1-"$nm" -tc "$MAX_JOBS" \
+        ${espera:+-hold_jid "$espera"} \
+        -v MANIFEST="$snap/manifest_reparo.tsv","$(env_do_snap "$snap")" \
+        "$snap/stages/reparar_zips.job" | head -1 | cut -d. -f1)
+    jid_ok "$jid2" "reparar_zips"
+    note "fase 2: job $jid2 ($nm especie(s), espera ${espera:-nada})"
+    note "depois que ele terminar, junte tudo com:"
+    note "  ./kamces catalogs-ms --so-merge --all --uniforme"
+}
+
+# ------------------------------------------------------------- catalogs-ms --
+# A via manysketch: um acesso por vez, baixa -> esboca -> apaga, e um sig merge
+# no fim. Array por especie. O disco nunca segura mais de um par de FASTQ.
+cmd_catalogs_ms() {
+    python3 "$HERE/stages/checkflags.py" >/dev/null 2>&1 || {
+        python3 "$HERE/stages/checkflags.py"
+        kamces_die "corrija as flags acima antes de submeter"
+    }
+    # A senha e cobrada so por quem vai mesmo baixar FASTQ: --inventario,
+    # --detalhe, --so-merge e um --reparar que nao achou pendencia nao tocam
+    # na rede, e exigir a variavel ali so atrapalha.
+    local so_merge="" inventario="" detalhe="" modo_all="" modo_uni="" reparar=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --so-merge)   so_merge=1; shift ;;
+            --inventario) inventario=1; shift ;;
+            --detalhe)    inventario=1; detalhe=1; shift ;;
+            --all)        modo_all=1; shift ;;
+            --uniforme)   modo_uni=1; shift ;;
+            --reparar)    reparar=1; shift ;;
+            *) break ;;
+        esac
+    done
+
+    [ -n "$reparar" ] && { cmd_catalogs_ms_reparar "$@"; return $?; }
+    if [ -z "$inventario" ] && [ -z "$so_merge" ]; then
+        [ -n "${SRA_PASSWORD:-}" ] || kamces_die \
+            "exporte SRA_PASSWORD antes (export SRA_PASSWORD='...')."
+    fi
+
+    # UMA TAREFA POR ACESSO, e nao por especie. Uma especie tem ate 26 acessos
+    # lidos em fila; com 4 tarefas o cluster fica com 4 nucleos ocupados e a
+    # especie leva dias. Uma linha por (especie, acesso) transforma isso em ~78
+    # tarefas independentes, e o -tc decide quantas rodam juntas. Nada muda no
+    # calculo: cada acesso ja gravava o seu proprio zip.
+    # INVENTARIO: o estado exato de cada acesso, lendo o disco. E o que
+    # responde "onde a corrida anterior parou" sem depender de nenhum log.
+    local m="$MANIFEST_DIR/catalogs_ms.tsv"
+    local mm="$MANIFEST_DIR/catalogs_ms_merge.tsv"
+    local pend="$MANIFEST_DIR/catalogs_ms_pendentes.txt"
+    : > "$m"; : > "$mm"; : > "$pend"
+    local zips="${CATALOGS_MS_ZIPS:-$CATALOGS_DIR/zips_por_acesso}"
+    # SO O SCALED MAIS FINO E BAIXADO. Os grossos saem por downsample depois
+    # do merge, entao o inventario procura UM zip por (acesso, k), e nao um
+    # por (acesso, k, scaled). MS_TODOS_SCALED=1 volta ao antigo.
+    local fino; fino=$(printf '%s\n' $SCALEDS | sort -n | head -1)
+    local escalas="$fino"
+    [ -n "${MS_TODOS_SCALED:-}" ] && escalas="$SCALEDS"
+    # ZIP PRONTO E ZIP QUE ABRE. Um manysketch interrompido deixa arquivo
+    # truncado, que passa num `[ -s ]` e so estoura no sig merge. A pasta
+    # inteira e conferida de uma vez, e o resultado vira um conjunto.
+    local -A ZOK=()
+    local _n
+    while IFS= read -r _n; do [ -n "$_n" ] && ZOK["$_n"]=1; done < <(
+        python3 "$HERE/stages/zips_ok.py" --dir "$zips" 2>/dev/null || true)
+    local prontos=0 parciais=0 zerados=0 antigos=0
+    for sp in $SPECIES; do
+        printf '%s\n' "$sp" >> "$mm"
+        local acs; acs=$(STAGES="$HERE/stages" python3 - "$sp" <<'PY'
+import os, sys
+sys.path.insert(0, os.environ["STAGES"])
+from catalogs import samples_for_species
+print(" ".join(samples_for_species(sys.argv[1], "skip")))
+PY
+)
+        local a k sc tenho preciso falta_k
+        for a in $acs; do
+            tenho=0; preciso=0
+            for k in $KS; do
+                # este k ainda precisa de alguma saida?
+                falta_k=""
+                for sc in $SCALEDS; do
+                    [ -s "$CATALOGS_DIR/${sp}_${k}_scaled${sc}.sig" ] && [ -z "${FORCAR:-}" ] && continue
+                    falta_k=1
+                done
+                [ -n "$falta_k" ] || continue
+                for sc in $escalas; do
+                    preciso=$(( preciso + 1 ))
+                    [ -n "${ZOK[${sp}_${a}_k${k}_scaled${sc}.zip]:-}" ] && tenho=$(( tenho + 1 ))
+                done
+            done
+            # Zips no formato ANTIGO ({acesso}_scaled{N}.zip, sem o k no nome)
+            # nao servem: eles carregam varios k juntos e o sig merge -k ficaria
+            # ambiguo. Contamos so para avisar.
+            ls "$zips/${sp}_${a}_scaled"*.zip >/dev/null 2>&1 && antigos=$(( antigos + 1 ))
+            if [ "$preciso" -eq 0 ]; then prontos=$(( prontos + 1 ))
+            elif [ "$tenho" -ge "$preciso" ]; then prontos=$(( prontos + 1 ))
+            else
+                [ "$tenho" -gt 0 ] && parciais=$(( parciais + 1 )) || zerados=$(( zerados + 1 ))
+                printf '%s\t%s\n' "$sp" "$a" >> "$m"
+                printf '%s\n' "$a" >> "$pend"
+            fi
+        done
+    done
+    local n nm; n=$(wc -l < "$m"); nm=$(wc -l < "$mm")
+
+    # COMBINACAO ORFA: entrou no config DEPOIS que o esboço rodou, entao
+    # nenhum acesso tem o zip dela. Como o FASTQ e apagado apos cada acesso,
+    # incluir uma combinacao nova obriga a REBAIXAR todos os acessos. Sem este
+    # aviso o sintoma e so "0 completo", que parece bug do inventario.
+    # COMBINACAO ORFA: precisa de FASTQ que nao esta mais em disco. Com a
+    # derivacao pos-merge, um scaled GROSSO novo nunca e orfao - ele sai do
+    # zip fino. Orfao agora e um k novo, que exige reler os FASTQ.
+    local orfas=0 orfas_txt=""
+    for k in $KS; do
+        local com_zip=0 sem_final=0
+        for sp in $SPECIES; do
+            for sc in $SCALEDS; do
+                [ -s "$CATALOGS_DIR/${sp}_${k}_scaled${sc}.sig" ] || sem_final=1
+            done
+            ls "$zips"/*_k${k}_scaled${fino}.zip >/dev/null 2>&1 && com_zip=1
+        done
+        if [ "$sem_final" = 1 ] && [ "$com_zip" = 0 ]; then
+            orfas=$(( orfas + 1 ))
+            orfas_txt="${orfas_txt:+$orfas_txt, }k=$k"
+        fi
+    done
+
+    note "acessos: $prontos completo(s), $parciais pela metade, $zerados sem nada"
+    if [ "$orfas" -gt 0 ]; then
+        note ""
+        note "ATENCAO: $orfas valor(es) de k do config nao existem em NENHUM acesso:"
+        note "  $orfas_txt"
+        note "  Entraram no config depois que o esboço comecou. Como o FASTQ e"
+        note "  apagado apos cada acesso, mante-los obriga a REBAIXAR os 78 acessos"
+        note "  so para calcula-los - e por isso que aparece '0 completo'."
+        note "  (Um scaled novo NAO da nisso: ele sai por downsample do scaled=$fino.)"
+        note "  Se o k nao for essencial, tire-o do KS e re-rode este inventario."
+    fi
+    [ "$antigos" -gt 0 ] && note "AVISO: $antigos acesso(s) com zip no formato antigo (sem o k no nome) - serao refeitos"
+    if [ -n "$detalhe" ]; then
+        say "inventario detalhado (nada foi submetido)"
+        note "CATALOGS_DIR     = $CATALOGS_DIR"
+        note "zips por acesso  = $zips"
+        note "config em uso    = $KAMCES_CONFIG"
+        note "KS={$KS}  SCALEDS={$SCALEDS}"
+        echo
+        # `| head` fecha o cano e o basename morre de SIGPIPE; sob pipefail isso
+        # derruba o resto do relatorio. Materializa a lista antes de cortar.
+        local lista; lista="$(cd "$CATALOGS_DIR" 2>/dev/null && ls -1 *.sig 2>/dev/null || true)"
+        local nsig; nsig=$(printf '%s' "$lista" | grep -c . || true)
+        note "assinaturas finais ($nsig arquivo(s)):"
+        printf '%s\n' "$lista" | sed -n '1,24p' | sed 's/^/     /'
+        [ "${nsig:-0}" -gt 24 ] && note "   ... e mais $(( nsig - 24 ))"
+        echo
+        local lz; lz="$(cd "$zips" 2>/dev/null && ls -1 *.zip 2>/dev/null || true)"
+        local nz; nz=$(printf '%s' "$lz" | grep -c . || true)
+        note "zips por acesso ($nz arquivo(s)); 5 primeiros:"
+        printf '%s\n' "$lz" | sed -n '1,5p' | sed 's/^/     /'
+        echo
+        # Tabela combinacao a combinacao para o PRIMEIRO acesso de cada especie
+        for sp in $SPECIES; do
+            local a1; a1=$(grep -m1 "^$sp	" "$m" 2>/dev/null | cut -f2)
+            [ -n "$a1" ] || a1=$(STAGES="$HERE/stages" python3 -c "
+import os,sys; sys.path.insert(0, os.environ['STAGES'])
+from catalogs import samples_for_species
+print(samples_for_species('$sp','skip')[0])" 2>/dev/null)
+            [ -n "$a1" ] || continue
+            note "$sp / $a1 - o que o inventario procura:"
+            printf '     %-4s %-6s %-22s %s\n' k scaled "final .sig existe?" "zip scaled=$fino abre?"
+            for k in $KS; do for sc in $SCALEDS; do
+                local f z
+                [ -s "$CATALOGS_DIR/${sp}_${k}_scaled${sc}.sig" ] && f="SIM" || f="nao"
+                [ -n "${ZOK[${sp}_${a1}_k${k}_scaled${fino}.zip]:-}" ] && z="SIM" || z="nao"
+                printf '     %-4s %-6s %-22s %s\n' "$k" "$sc" "$f" "$z"
+            done; done
+            echo
+        done
+        return 0
+    fi
+    if [ -n "$inventario" ]; then
+        say "inventario (nada foi submetido)"
+        note "faltam $n acesso(s); lista em $m"
+        [ "$n" -gt 0 ] && sed 's/^/   /' "$m" | head -30
+        [ "$n" -gt 30 ] && note "... e mais $(( n - 30 ))"
+        return 0
+    fi
+    if [ "$n" -eq 0 ] && [ -z "$so_merge" ]; then
+        note "nenhum acesso pendente - so o merge sera submetido"
+        so_merge=1
+    fi
+
+    local nk nsc tem=0 falta=0
+    nk=$(printf '%s\n' $KS | wc -l); nsc=$(printf '%s\n' $SCALEDS | wc -l)
+    for sp in $SPECIES; do for k in $KS; do for sc in $SCALEDS; do
+        if [ -s "$CATALOGS_DIR/${sp}_${k}_scaled${sc}.sig" ]; then
+            tem=$(( tem + 1 )); else falta=$(( falta + 1 )); fi
+    done; done; done
+
+    # TETO DE DISCO. Cada tarefa segura UM par de FASTQ enquanto esboca, entao
+    # o pico do estagio e a soma dos acessos baixando ao mesmo tempo - ou seja,
+    # o -tc. O planejador olha os tamanhos reais (SraRunTable) e devolve o maior
+    # -tc cujo PIOR CASO (as N maiores simultaneas) cabe no teto.
+    local teto="${TETO_DISCO_GB:-1000}"
+    local tc; tc=$(python3 "$HERE/stages/planejar_disco.py" \
+        --teto-gb "$teto" --folga "${FOLGA_DISCO:-1.3}" \
+        --pendentes "$pend" --maximo "$MAX_JOBS" 2>/tmp/kamces_disco.$$ || echo 1)
+    sed 's/^/   /' "/tmp/kamces_disco.$$" >&2 2>/dev/null || true
+    rm -f "/tmp/kamces_disco.$$"
+    case "$tc" in ''|*[!0-9]*) tc=1 ;; esac
+    TC_ESTAGIO="$tc"
+
+    say "01 catalogos via manysketch: $nm especie(s), k={$KS}, scaled={$SCALEDS}"
+    note "array com $n tarefa(s): 1 por ACESSO, ate $tc ao mesmo tempo (teto ${teto} GB)"
+    note "assinaturas: $(( nm * nk * nsc )) no total, $tem em disco, $falta a gerar"
+    note "por acesso: baixa os 2 mates -> manysketch no scaled=$fino -> apaga os FASTQ"
+    note "os scaled grossos saem do fundido, por downsample (MS_TODOS_SCALED=1 desliga)"
+    note "acesso ja esbocado e pulado sem baixar nada - da para re-submeter a vontade"
+    note "zips por acesso: ${CATALOGS_MS_ZIPS:-$CATALOGS_DIR/zips_por_acesso}"
+    note "pico de disco por tarefa: um par de FASTQ (APAGAR_ZIPS=1 limpa os zips no fim)"
+
+    local espera=""
+    if [ -z "$so_merge" ]; then
+        JID_CAT_MS=$(submit catalogs_ms "$n" "$m" \
+            -v SRA_PASSWORD="$SRA_PASSWORD",FORCAR="${FORCAR:-}",MS_THREADS="${MS_THREADS:-}",TETO_DISCO_GB="$teto",MS_TODOS_SCALED="${MS_TODOS_SCALED:-}" "$@")
+        jid_ok "$JID_CAT_MS" "catalogs_ms"
+        note "esboço: job $JID_CAT_MS  ($n tarefas)"
+        espera="$JID_CAT_MS"
+    else
+        note "--so-merge: nada sera baixado, so o sig merge do que ja existe"
+    fi
+
+    # O merge espera o array inteiro e roda uma tarefa por especie. Reusa o
+    # instantaneo do esboço quando ele existe, para os dois jobs rodarem
+    # exatamente o mesmo codigo e o mesmo config.
+    local ldm; ldm="$(logdir_for catalogs_ms_merge)"
+    local snapm=""
+    [ -z "$so_merge" ] && snapm="$(ultimo_snap)"
+    if [ -z "$snapm" ]; then
+        snapm="$(instantaneo catalogs_ms_merge "$mm")"; poda_instantaneos
+        note "instantaneo: $snapm"
+    fi
+    cp "$mm" "$snapm/manifest_merge.tsv"
+
+    # --uniforme: a lista de acessos de profundidade equivalente e calculada
+    # AQUI e congelada no instantaneo, para o merge nao depender de recalcular.
+    local selecao=""
+    if [ -n "$modo_uni" ]; then
+        selecao="$snapm/selecao_uniforme.tsv"
+        python3 "$HERE/stages/uniformizar.py" --species "$SPECIES" \
+            --referencia "${UNIFORME_REF:-spontaneum}" --saida "$selecao" \
+            > "$MANIFEST_DIR/selecao_uniforme.txt" 2>&1 \
+            || { sed 's/^/   /' "$MANIFEST_DIR/selecao_uniforme.txt" >&2
+                 kamces_die "nao consegui montar a selecao uniforme"; }
+        note "selecao uniforme: $(grep -c . "$selecao") acesso(s); relatorio em"
+        note "  $MANIFEST_DIR/selecao_uniforme.txt"
+    fi
+    TC_ESTAGIO=""   # o merge nao usa disco de FASTQ: volta ao MAX_JOBS
+    JID_CAT_MS_MERGE=$(qsub -terse -N kamces_cat_ms_merge -q "$QUEUE" \
+        ${QSUB_L[@]+"${QSUB_L[@]}"} -o "$ldm" -e "$ldm" -t 1-"$nm" -tc "$MAX_JOBS" \
+        ${espera:+-hold_jid "$espera"} \
+        -v MANIFEST="$snapm/manifest_merge.tsv","$(env_do_snap "$snapm")",FORCAR="${FORCAR:-}",APAGAR_ZIPS="${APAGAR_ZIPS:-}",MODO_ALL="${modo_all:-}",MODO_UNI="${modo_uni:-}",SELECAO="${selecao:-}",MS_TODOS_SCALED="${MS_TODOS_SCALED:-}" \
+        "$snapm/stages/catalogs_ms_merge.job" | head -1 | cut -d. -f1)
+    jid_ok "$JID_CAT_MS_MERGE" "catalogs_ms_merge"
+    note "merge : job $JID_CAT_MS_MERGE  ($nm tarefas, espera ${espera:-nada})"
+}
+
+# -------------------------------------------------------------------- bench --
+# Roda no no de login ou numa sessao interativa: mede rede, descompressao e
+# sketch separadamente para dizer QUAL dos tres esta custando o tempo.
+cmd_bench() {
+    : "${SRA_PASSWORD:?exporte SRA_PASSWORD antes (o bench le um FASTQ real)}"
+    py_local sourmash
+    # Sem --base-url: o proprio catalogs.py ja traz o servidor padrao.
+    python3 "$HERE/stages/bench.py" \
+        --username "$SRA_USER" --password "$SRA_PASSWORD" \
+        --ks "$KS" --lote "${LOTE_READS:-1000}" "$@"
+}
+
+
+
+
+
+# ------------------------------------------------------------------ pintura --
+# Pintura cromossomica: quem ganha em cada trecho, em vez do valor da metrica.
+# Existe porque a contencao satura - quase toda janela fica entre 0,9 e 1,0
+# com quase toda especie, e o grafico de valor gasta o eixo inteiro mostrando
+# que ele nao varia.
+cmd_pintura() {
+    local metrica="${KAMCES_METRICA_PINTURA:-window_containment_in_reference}"
+    local amostra=""
+    local conjs; conjs="$(conjuntos_de "$@")"
+    local gens;  gens="$(genomas_de "$@")"
+    local args; mapfile -t args < <(sem_flags_conjunto "$@")
+    set -- ${args[@]+"${args[@]}"}
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --metrica) metrica="${2:-}"
+                       [ $# -ge 2 ] && shift 2 || shift ;;
+            --sample)  amostra="${2:-}"
+                       [ $# -ge 2 ] && shift 2 || shift ;;
+            *) break ;;
+        esac
+    done
+    pre_voo_r "$HERE/stages/pintura.R"
+    local m="$MANIFEST_DIR/pintura.tsv"
+    : > "$m"
+    local c g src dst
+    for g in $gens; do for c in $conjs; do
+        src="$(indices_de "$c" "$g")"; dst="$(graficos_de "$c" "$g")/pintura"
+        if [ ! -d "$src" ]; then note "$g x $c: $src nao existe, pulando"; continue; fi
+        mkdir -p "$dst"
+        monta_manifesto_parquet "$src" "$dst" "$m" "$amostra" "$g x $c"
+        note "$g x $c: saida em $dst"
+    done; done
+    local n; n=$(wc -l < "$m")
+    [ "$n" -gt 0 ] || kamces_die "nenhuma pasta com .parquet em $src"
+    say "04b pintura: $n cromossomo(s)"
+    note "metrica: $metrica"
+    export KAMCES_METRICA_PINTURA="$metrica"
+    local j; j=$(submit pintura "$n" "$m" "$@")
+    jid_ok "$j" "pintura"
+    note "job $j"
+}
+
+
+
+# --------------------------------------------------------------------- refs --
+# ------------------------------------------------------------------ derivar --
+# Roda no NO DE LOGIN, em segundos: so le .sig do disco e grava .sig no disco.
+# Um scaled grosso e um subconjunto exato do fino, entao nao ha nada a
+# recalcular e nada a baixar.
+cmd_derivar() {
+    py_local sourmash
+    python3 "$HERE/stages/derivar.py" \
+        --catalogs-dir "$CATALOGS_DIR" \
+        --species $SPECIES --ks $KS --scaled $SCALEDS "$@"
+}
+
+# Confere as referencias de UM conjunto (ou do normal, sem flag).
+cmd_refs() {
+    local conjs; conjs="$(conjuntos_de "$@")"
+    local resto; mapfile -t resto < <(sem_flags_conjunto "$@")
+    # Sem flag nenhuma, `conjuntos_de` devolve os dois; aqui o util e conferir
+    # so o normal quando o usuario nao pediu nada.
+    case " $* " in *" --"*) ;; *) conjs="normal" ;; esac
+    local c rot rc=0
+    for c in $conjs; do
+        rot="$(rotulos_de "$c")"
+        if [ -z "$rot" ]; then
+            note "conjunto $c: nenhum catalogo - pulando"
+            continue
+        fi
+        [ "$conjs" = "normal" ] || say "conjunto $c: ${rot//,/ }"
+        python3 "$HERE/stages/checkrefs.py" \
+            --catalogs-dir "$CATALOGS_DIR" \
+            --species ${rot//,/ } --ks $KS --scaleds $SCALEDS \
+            ${resto[@]+"${resto[@]}"} || rc=1
+    done
+    return $rc
+}
+
+# ------------------------------------------------------------------ sliding --
+# MONTA O MANIFESTO IDEAL DO SLIDING: tudo o que DEVERIA existir.
+#   $1 manifesto   $2 conjuntos   $3 genomas   $4 --sample   $5 "" ou "quieto"
+# Uma funcao so, usada pelo sliding E pelo refazer: e o unico jeito de a lista
+# que se refaz ser exatamente a lista que se produz.
+#   $6 "so-existentes" = pula combinacao cuja pasta de saida nem existe
+monta_manifesto_sliding() {
+    local m="$1" conjs="$2" gens="$3" amostra="${4:-}" quieto="${5:-}"
+    local so_existentes="${6:-}"
+    : > "$m"
+    local c g rot destino antes agora n_fasta
+    for g in $gens; do
+        # Os FASTA deste eixo, uma vez por eixo (nao por conjunto).
+        local pares=(); local linha
+        while IFS= read -r linha; do [ -n "$linha" ] && pares+=("$linha"); done \
+            < <(fastas_de "$g")
+        if [ "${#pares[@]}" -eq 0 ]; then
+            note "$g: nenhum FASTA encontrado - pulando"
+            continue
+        fi
+        # QUANTOS DE CADA ROTULO. "23 FASTA" nao diz nada; "of=13 sp=10" diz
+        # na hora que uma das pastas tem arquivo a mais do que voce espera.
+        if [ -z "$quieto" ]; then
+            local contagem="" rl
+            for rl in $(printf '%s\n' "${pares[@]}" | cut -f1 | sort -u); do
+                contagem="${contagem:+$contagem }${rl:-(principal)}=$(printf '%s\n' "${pares[@]}" | cut -f1 | grep -cx "$rl")"
+            done
+            [ -n "${contagem// /}" ] && note "$g: ${#pares[@]} FASTA ($contagem)"
+        fi
+        for c in $conjs; do
+            rot="$(rotulos_de "$c")"
+            if [ -z "$rot" ]; then
+                note "$c: nenhum catalogo com esse padrao de nome - pulando"
+                continue
+            fi
+            destino="$(indices_de "$c" "$g")"
+            # ARVORE QUE NUNCA RODOU. O sliding cria a pasta de saida conforme
+            # avanca; se a raiz nem existe, aquela combinacao nao foi rodada
+            # ainda - e "refazer" o que nunca comecou nao e refazer, e comecar.
+            # Sem isto, o refazer enfiava as 1260 tarefas da arvore que voce
+            # ainda nao quer no meio das que voce quer de volta.
+            if [ -n "$so_existentes" ] && [ ! -d "$destino" ]; then
+                note "$g x $c: $destino nao existe - nao rodou ainda, pulando"
+                continue
+            fi
+            if [ -z "$quieto" ]; then
+                note "$g x $c -> referencias: ${rot//,/ }"
+                note "$g x $c -> saida: $destino"
+            fi
+            antes=$(wc -l < "$m"); n_fasta=0
+            # DOIS FASTA COM O MESMO NOME DE SAIDA. Acontece de verdade: uma
+            # pasta com Chr01.fa e Chr01.fasta do mesmo cromossomo colapsa no
+            # mesmo "stem" e as duas tarefas escreveriam o MESMO Parquet.
+            # Aqui guardamos QUAL arquivo gerou cada nome, para a mensagem
+            # poder apontar a causa.
+            local -A DE_ONDE=()
+            local vistos=0 p rotf fasta stem
+            for p in "${pares[@]}"; do
+                rotf="${p%%$'\t'*}"; fasta="${p#*$'\t'}"
+                stem="$(basename "$fasta")"; stem="${stem%.gz}"; stem="${stem%.*}"
+                # PREFIXO DO ROTULO. of/Chr01 e sp/Chr01 existem os dois, com
+                # o mesmo nome: sem isto, uma tarefa sobrescreveria a outra.
+                [ -n "$rotf" ] && stem="${rotf}_${stem}"
+                if [ -n "$amostra" ]; then
+                    case "$amostra" in
+                        ''|*[!0-9]*)
+                            local quer="" nome
+                            for nome in ${amostra//,/ }; do
+                                [ "$nome" = "$stem" ] && quer=1
+                            done
+                            [ -n "$quer" ] || continue ;;
+                        *)
+                            vistos=$(( vistos + 1 ))
+                            [ "$vistos" -le "$amostra" ] || continue ;;
+                    esac
+                fi
+                if [ -n "${DE_ONDE[$stem]:-}" ] && [ "${DE_ONDE[$stem]}" != "$fasta" ]; then
+                    kamces_die "dois FASTA dao o mesmo nome de saida ('$stem'):
+    ${DE_ONDE[$stem]}
+    $fasta
+  Os dois escreveriam $destino/$stem/ - decida qual vale e tire o outro da
+  pasta, ou filtre com GENOME_VALID_PADRAO / GENOME_PADRAO no config.sh."
+                fi
+                DE_ONDE[$stem]="$fasta"
+                n_fasta=$(( n_fasta + 1 ))
+                for k in $KS; do for sc in $SCALEDS; do
+                    # A 5a coluna e a lista de referencias: e ela que faz a
+                    # mesma tarefa comparar contra os catalogos certos.
+                    printf '%s\t%s\t%s\t%s\t%s\n' "$fasta" \
+                           "$destino/$stem/${stem}_k${k}_sc${sc}.parquet" "$k" "$sc" "$rot" >> "$m"
+                done; done
+            done
+            agora=$(wc -l < "$m")
+            [ -z "$quieto" ] && note "$g x $c: $n_fasta FASTA${amostra:+ (--sample $amostra)} x $(echo $KS|wc -w) k x $(echo $SCALEDS|wc -w) scaled = $(( agora - antes )) tarefa(s)"
+        done
+    done
+    # Destino repetido significa duas tarefas escrevendo o mesmo Parquet - o
+    # tipo de erro que so aparece como arquivo corrompido, horas depois.
+    local dup; dup=$(cut -f2 "$m" | sort | uniq -d | head -3)
+    if [ -n "$dup" ]; then
+        echo "KaMcEs: destinos repetidos no manifesto:" >&2
+        printf '%s\n' "$dup" | while IFS= read -r d; do
+            [ -n "$d" ] || continue
+            echo "  $d" >&2
+            grep -F "	$d	" "$m" | cut -f1 | sed 's/^/      vindo de: /' >&2
+        done
+        kamces_die "duas tarefas escreveriam o mesmo Parquet - corrija antes de submeter"
+    fi
+}
+
+# Confere as referencias de cada conjunto pedido, antes de submeter nada.
+pre_voo_refs() {
+    [ "${PULAR_REFS:-no}" = "yes" ] && return 0
+    local c rot
+    for c in $1; do
+        rot="$(rotulos_de "$c")"
+        [ -n "$rot" ] || continue
+        if ! python3 "$HERE/stages/checkrefs.py" --catalogs-dir "$CATALOGS_DIR" \
+               --species ${rot//,/ } --ks $KS --scaleds $SCALEDS >/dev/null 2>&1; then
+            python3 "$HERE/stages/checkrefs.py" --catalogs-dir "$CATALOGS_DIR" \
+               --species ${rot//,/ } --ks $KS --scaleds $SCALEDS || true
+            echo >&2
+            kamces_die "conjunto $c: as assinaturas de referencia nao casam (veja acima).
+  Para submeter assim mesmo: PULAR_REFS=yes ./kamces sliding"
+        fi
+    done
+}
+
+cmd_sliding() {
+    local conjs; conjs="$(conjuntos_de "$@")"
+    local gens;  gens="$(genomas_de "$@")"
+    local args;  mapfile -t args < <(sem_flags_conjunto "$@")
+    set -- ${args[@]+"${args[@]}"}
+    # --sample: quantos cromossomos, ou quais. Um cromossomo sao 12 tarefas em
+    # vez de 1260 - o jeito barato de ver se uma combinacao nova produz o que
+    # voce espera antes de soltar tudo.
+    local amostra=""
+    local resto=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --sample) amostra="${2:-}"
+                      [ $# -ge 2 ] && shift 2 || shift ;;
+            *) resto+=("$1"); shift ;;
+        esac
+    done
+    local m="$MANIFEST_DIR/sliding.tsv"
+    say "02 sliding: referencias {${conjs% }}  genomas {$gens}"
+    pre_voo_refs "$conjs"
+    monta_manifesto_sliding "$m" "$conjs" "$gens" "$amostra"
+
+    local n; n=$(wc -l < "$m")
+    [ "$n" -gt 0 ] || kamces_die "nada a submeter (nenhum FASTA, ou nenhum catalogo)"
+    note "TOTAL: $n tarefa(s)"
+    JID_SLIDING=$(submit sliding "$n" "$m" ${resto[@]+"${resto[@]}"})
+    jid_ok "$JID_SLIDING" "sliding"
+    note "job $JID_SLIDING"
+}
+
+
+cmd_plots() {
+    # --metricas / --escalas restringem o QUE sai; --sample restringe DE QUAIS
+    # cromossomos. Cada imagem tem 8400x3600 px: rodar tudo nos 105
+    # cromossomos e caro quando voce so quer ver se ficou bom.
+    local metricas="${KAMCES_METRICAS:-}" escalas="${KAMCES_ESCALAS:-}" amostra=""
+    local conjs; conjs="$(conjuntos_de "$@")"
+    local gens;  gens="$(genomas_de "$@")"
+    local args; mapfile -t args < <(sem_flags_conjunto "$@")
+    set -- ${args[@]+"${args[@]}"}
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --metricas) metricas="${2:-}"
+                        [ $# -ge 2 ] && shift 2 || shift ;;
+            --escalas)  escalas="${2:-}"
+                        [ $# -ge 2 ] && shift 2 || shift ;;
+            --sample)   amostra="${2:-}"
+                        [ $# -ge 2 ] && shift 2 || shift ;;
+            --so-contencao) metricas="contencao"; escalas="normal"; shift ;;
+            *) break ;;
+        esac
+    done
+    pre_voo_r "$HERE/stages/plots.R"
+    local m="$MANIFEST_DIR/plots.tsv"
+    : > "$m"
+    local c g src dst
+    for g in $gens; do for c in $conjs; do
+        src="$(indices_de "$c" "$g")"; dst="$(graficos_de "$c" "$g")"
+        if [ ! -d "$src" ]; then note "$g x $c: $src nao existe, pulando"; continue; fi
+        mkdir -p "$dst"
+        monta_manifesto_parquet "$src" "$dst" "$m" "$amostra" "$g x $c"
+    done; done
+    local n; n=$(wc -l < "$m")
+    [ "$n" -gt 0 ] || kamces_die "nenhuma pasta com .parquet para plotar"
+    say "04 graficos: $n tarefa(s)"
+    [ -n "$metricas" ] && note "metricas: $metricas"
+    [ -n "$escalas" ]  && note "escalas : $escalas"
+    # Exportadas em vez de passadas num segundo -v: o plots.job tem #$ -V, que
+    # leva o ambiente de quem submeteu. Empilhar dois -v no mesmo qsub e um
+    # comportamento que varia entre versoes do Grid Engine, e este pipeline ja
+    # perdeu tempo demais com detalhe de qsub.
+    export KAMCES_METRICAS="$metricas" KAMCES_ESCALAS="$escalas"
+    JID_PLOTS=$(submit plots "$n" "$m" "$@")
+    jid_ok "$JID_PLOTS" "plots"
+    note "job $JID_PLOTS"
+}
+
+
+# ---------------------------------------------------------------------- all --
+# O pipeline inteiro, encadeado por -hold_jid: catalogos -> janela -> graficos.
+#
+# As flags de conjunto (--normal/--uniform/--valid/--all) valem para o sliding
+# e para os graficos, e NAO sao repassadas ao catalogs-ms, que nao as conhece:
+# ele monta os tres tipos de catalogo de uma vez so.
+cmd_all() {
+    local conj; mapfile -t conj < <(printf '%s\n' "$@" | grep -E '^--(normal|uniform|uniformizado|valid|validacao|all)$' || true)
+    local resto; mapfile -t resto < <(sem_flags_conjunto "$@")
+    cmd_catalogs_ms ${resto[@]+"${resto[@]}"} --all --uniforme
+    cmd_sliding ${conj[@]+"${conj[@]}"} -hold_jid "$JID_CAT_MS_MERGE"
+    cmd_plots   ${conj[@]+"${conj[@]}"} -hold_jid "$JID_SLIDING"
+    say "pipeline completo submetido"
+}
+
+
+# ------------------------------------------------------------------ refazer --
+cmd_refazer() {
+    # TODAS as arvores QUE JA EXISTEM, por padrao. Duas coisas de uma vez:
+    # conferir so a "normal" era o jeito de deixar 400 tarefas perdidas nas
+    # outras; e incluir uma arvore que voce ainda nao rodou seria enfiar 1260
+    # tarefas novas no meio das que voce quer de volta.
+    #
+    #   ./kamces refazer                        as arvores que existem
+    #   ./kamces refazer --uniform              so as de catalogo uniformizado
+    #   ./kamces refazer --genomas validacao    so as dos cromossomos de teste
+    #   ./kamces refazer --tudo                 inclui as que nunca rodaram
+    local conjs; conjs="$(conjuntos_de "$@")"
+    # Sem --genomas, o refazer olha os DOIS eixos; com --genomas, obedece.
+    # (`genomas_de` sozinho tem `principal` como padrao, que aqui seria
+    # esquecer metade das arvores.)
+    local gens
+    case " $* " in
+        *" --genomas "*) gens="$(genomas_de "$@")" ;;
+        *)               gens="principal validacao" ;;
+    esac
+    local args;  mapfile -t args < <(sem_flags_conjunto "$@")
+    set -- ${args[@]+"${args[@]}"}
+    local amostra="" apagar=1 estados="" tc="$MAX_JOBS" tudo="" varrer=""
+    local nivel="exata" forcar=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --sample)      amostra="${2:-}"; [ $# -ge 2 ] && shift 2 || shift ;;
+            --estados)     estados="${2:-}"; [ $# -ge 2 ] && shift 2 || shift ;;
+            --tc)          tc="${2:-}";      [ $# -ge 2 ] && shift 2 || shift ;;
+            --sem-apagar)  apagar=""; shift ;;
+            # --varrer NAO passa mais estados="NADA": aquilo ia como
+            # `--estados NADA` para o checar_sliding.py, que valida o nome
+            # contra a lista de estados e morria com "estado(s) invalido(s)".
+            # Quem nao submete nada agora e o proprio job, por REFAZER_VARRER.
+            --varrer)      apagar=""; varrer=1; shift ;;
+            --tudo)        tudo=1; shift ;;
+            # NIVEL DA CONFERENCIA. O padrao e o mais preciso; estas duas
+            # descem de nivel quando voce quer so uma varrida.
+            --rapido)      nivel="rapida"; shift ;;
+            --funda)       nivel="funda"; shift ;;
+            --forcar)      forcar=1; shift ;;
+            *) kamces_die "opcao desconhecida em refazer: $1
+  uso: ./kamces refazer [--normal|--uniform|--all] [--genomas ...]
+                        [--sample N|nomes] [--estados 'AUSENTE CURTO ...']
+                        [--varrer] [--sem-apagar] [--tudo] [--tc N]
+                        [--rapido|--funda] [--forcar]
+
+  Por padrao ele confere so as arvores QUE JA EXISTEM em disco - a que voce
+  ainda nao rodou nao entra. --tudo inclui tambem as que nunca rodaram.
+
+  A conferencia e EXATA por padrao: rodape do Parquet, leitura das colunas de
+  janela e os comprimentos dos FASTA (em cache). --funda dispensa os FASTA,
+  --rapido fica so no rodape. --forcar solta o freio de mao que barra uma
+  limpeza de mais de 25% dos arquivos existentes." ;;
+        esac
+    done
+
+    say "refazer: confere as saidas do sliding e re-submete o que falta"
+    note "referencias {${conjs% }}  genomas {$gens}"
+
+    # O MANIFESTO IDEAL E MONTADO AQUI, pela MESMA funcao do sliding - e o
+    # unico jeito de a lista que se refaz carregar a coluna de referencias
+    # certa de cada arvore. E baratinho: so um `find` nas pastas de FASTA.
+    local m="$MANIFEST_DIR/refazer_ideal.tsv"
+    pre_voo_refs "$conjs"
+    # Invertido de proposito: --tudo DESLIGA o filtro. Escrito em duas linhas
+    # porque a versao "${tudo:+}${tudo:-so-existentes}" fazia o contrario do
+    # que parece - com tudo=1 ela devolve "1", que e nao-vazio, e o filtro
+    # ficava LIGADO justamente quando voce pediu para incluir tudo.
+    local so_ex="so-existentes"; [ -n "$tudo" ] && so_ex=""
+    monta_manifesto_sliding "$m" "$conjs" "$gens" "$amostra" "" "$so_ex"
+    local n; n=$(wc -l < "$m")
+    [ "$n" -gt 0 ] || kamces_die "nada a conferir (nenhum FASTA, ou nenhum catalogo)"
+    note "manifesto ideal: $n combinacao(oes) esperadas"
+
+    # A CONFERENCIA VAI PARA A FILA. Sao milhares de Parquet para abrir no
+    # /Storage; nao e servico de no de login. O job confere, apaga o que
+    # quebrou e da o qsub do array - o tamanho do array so se sabe depois de
+    # conferir, e o SGE precisa do tamanho na submissao.
+    local snap; snap="$(instantaneo refazer "$m")"; poda_instantaneos
+    note "instantaneo: $snap"
+    local ideal="$snap/manifest.tsv"
+    local pend="$snap/refazer_pendentes.tsv"
+    local ld;  ld="$(logdir_for sliding)"
+    local ldr; ldr="$(logdir_for refazer)"
+    local recursos=""
+    [ ${#QSUB_L[@]} -gt 0 ] && recursos="${QSUB_L[1]}"
+
+    case "$nivel" in
+        exata) note "conferencia EXATA: rodape + colunas de janela + comprimentos dos FASTA" ;;
+        funda) note "conferencia funda: rodape + colunas de janela (sem ler FASTA)" ;;
+        *)     note "conferencia rapida: so o rodape do Parquet" ;;
+    esac
+    [ -n "$apagar" ] && note "vai APAGAR o que estiver quebrado (o .parts NAO: e trabalho aproveitavel)" \
+                     || note "--sem-apagar: so relata, nao apaga nada"
+    [ -n "$forcar" ] && note "--forcar: o freio de mao da limpeza esta solto"
+    [ -n "$varrer" ] && note "--varrer: so o relatorio, nada sera submetido"
+
+    diz_recursos
+    local jid; jid=$(qsub -terse -N kamces_refazer -q "$QUEUE" \
+        ${QSUB_L[@]+"${QSUB_L[@]}"} -o "$ldr" -e "$ldr" -t 1-1 -tc 1 \
+        -v MANIFEST="$ideal","$(env_do_snap "$snap")",REFAZER_IDEAL="$ideal",REFAZER_PENDENTES="$pend",REFAZER_APAGAR="$apagar",REFAZER_ESTADOS="$estados",REFAZER_VARRER="$varrer",REFAZER_NIVEL="$nivel",REFAZER_FORCAR="$forcar",REFAZER_CACHE="$MANIFEST_DIR/janelas_esperadas.tsv",REFAZER_LOGDIR="$ld",REFAZER_LOGDIR_CONS="$(logdir_for consolidar)",REFAZER_TC="$tc",REFAZER_QUEUE="$QUEUE",REFAZER_L="$recursos" \
+        "$snap/stages/refazer.job" | head -1 | cut -d. -f1)
+    jid_ok "$jid" "refazer"
+    note "job $jid (1 tarefa); log em $ldr"
+    note "ele confere, apaga o que quebrou e submete o array do sliding sozinho"
+}
+
+# -------------------------------------------------------------------- doctor --
+cmd_doctor() {
+    # Roda no NO DE EXECUCAO, nao no de login: o que importa e o que o job ve.
+    local ld; ld="$(logdir_for doctor)"
+    if [ "${1:-}" = "--local" ]; then
+        say "doctor (aqui, no no de login)"
+        env KAMCES_LIB="$KAMCES_LIB" CONFIG_FILE="$KAMCES_CONFIG" \
+            bash "$HERE/stages/doctor.job"
+        return 0
+    fi
+    say "doctor: submetendo ao no de execucao (saida em $ld)"
+    note "para rodar aqui mesmo: ./kamces doctor --local"
+    qsub -N kamces_doctor -q "$QUEUE" ${QSUB_L[@]+"${QSUB_L[@]}"} -o "$ld" -e "$ld" \
+         -v CONFIG_FILE="$KAMCES_CONFIG",KAMCES_LIB="$KAMCES_LIB" \
+         "$HERE/stages/doctor.job"
+}
+
+# ------------------------------------------------------------------- status --
+cmd_status() {
+    _count() { find "$1" -type f -name "$2" 2>/dev/null | wc -l; }
+    local nk nsc esperado
+    nk=$(echo $KS | wc -w); nsc=$(echo $SCALEDS | wc -w)
+    local nfasta; nfasta=$(find "$GENOME_DIR" -maxdepth 1 -type f \
+        \( -iname '*.fa' -o -iname '*.fasta' -o -iname '*.fa.gz' -o -iname '*.fasta.gz' \) 2>/dev/null | wc -l)
+    esperado=$(( nfasta * nk * nsc ))
+    printf '%s\n' "${c_bold}KaMcEs - situacao${c_off}"
+    printf '  %-26s %s\n' "FASTA de entrada" "$nfasta"
+    printf '  %-26s %s / %s\n' "catalogos (.sig)" \
+        "$(_count "$CATALOGS_DIR" '*.sig')" "$(( $(echo $SPECIES|wc -w) * nk * nsc ))"
+    printf '  %-26s %s / %s\n' "similaridades (.parquet)" \
+        "$(_count "$INDEXES_DIR" '*.parquet')" "$esperado"
+    printf '  %-26s %s\n' "zips de graficos" "$(_count "$PLOTS_SIM_DIR" '*.zip')"
+    local parts; parts=$(find "$INDEXES_DIR" -type d -name '*.parts' 2>/dev/null | wc -l)
+    if [ "$parts" -gt 0 ]; then
+        printf '  %-26s %s  %s\n' "partes inacabadas" "$parts" \
+            "${c_dim}(jobs interrompidos; ./kamces clean-parts para descartar)${c_off}"
+    fi
+    echo
+    qstat -u "${USER:-$(id -un)}" 2>/dev/null | head -15 || true
+}
+
+cmd_limpar() {
+    python3 "$HERE/stages/limpar.py" --dir "$INDEXES_DIR" "$@"
+}
+
+cmd_clean_parts() {
+    local found=()
+    while IFS= read -r -d '' d; do found+=("$d"); done \
+        < <(find "$INDEXES_DIR" -type d -name '*.parts' -print0 2>/dev/null)
+    if [ "${#found[@]}" -eq 0 ]; then say "nenhuma parte orfa"; return 0; fi
+    say "${#found[@]} pasta(s) de partes inacabadas:"
+    printf '   %s\n' "${found[@]:0:10}"
+    note "descartar significa recalcular essas janelas - nenhum dado consolidado se perde"
+    read -r -p "   remover? [s/N] " r
+    [[ "${r,,}" == "s" ]] && { rm -rf "${found[@]}"; say "removidas"; } || say "nada removido"
+}
+
+# --------------------------------------------------------------------- main --
+case "${1:-}" in
+    setup)       shift; cmd_setup "$@" ;;
+    catalogs-ms) shift; cmd_catalogs_ms "$@" ;;
+    sliding)     shift; cmd_sliding "$@" ;;
+    plots)       shift; cmd_plots "$@" ;;
+    all)         shift; cmd_all "$@" ;;
+    refazer)     shift; cmd_refazer "$@" ;;
+    pintura)     shift; cmd_pintura "$@" ;;
+    refs)        shift; cmd_refs "$@" ;;
+    derivar)     shift; cmd_derivar "$@" ;;
+    bench)       shift; cmd_bench "$@" ;;
+    bench-ms)    shift; cmd_bench_ms "$@" ;;
+    hist)        shift; cmd_hist "$@" ;;
+    doctor)      shift; cmd_doctor "$@" ;;
+    status)      shift; cmd_status "$@" ;;
+    limpar)      shift; cmd_limpar "$@" ;;
+    clean-parts) shift; cmd_clean_parts "$@" ;;
+    -v|--version|version)
+        cat "$HERE/VERSION"
+        # Impressao digital calculada AGORA, a partir dos arquivos em disco.
+        # O carimbo de build acima e escrito a mao e ja ficou parado entre
+        # versoes diferentes - o que torna "qual build eu tenho?" impossivel
+        # de responder. Isto aqui nao mente: dois KaMcEs com a mesma soma sao
+        # o mesmo codigo, arquivo por arquivo.
+        echo
+        echo "impressao digital dos arquivos em disco:"
+        (
+            cd "$HERE" || exit 0
+            for f in kamces config.sh.exemplo lib/*.sh lib/*.py \
+                     stages/*.py stages/*.sh stages/*.job stages/*.R; do
+                [ -f "$f" ] || continue
+                printf '  %-28s %s\n' "$f" \
+                    "$(md5sum "$f" 2>/dev/null | cut -c1-8)"
+            done
+            echo "  ----------------------------------------"
+            printf '  %-28s %s\n' "CONJUNTO" \
+                "$(cat kamces lib/*.sh lib/*.py stages/*.py stages/*.sh \
+                       stages/*.job stages/*.R 2>/dev/null \
+                   | md5sum | cut -c1-12)"
+        )
+        # Recursos efetivos: mostra o que este config pediria a fila.
+        echo
+        if [ ${#QSUB_L[@]} -eq 0 ]; then
+            echo "recursos pedidos a fila: NENHUM (H_VMEM/MEM_FREE/H_RT vazios)"
+        else
+            echo "recursos pedidos a fila: ${QSUB_L[1]}"
+        fi
+        echo "MAX_JOBS=${MAX_JOBS:-?}  STEP=${STEP:-?}  WINDOW_SIZE=${WINDOW_SIZE:-?}" ;;
+    ""|-h|--help|help)
+        awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "$HERE/kamces" ;;
+    *) kamces_die "subcomando desconhecido: $1 (use ./kamces --help)" ;;
+esac

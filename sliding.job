@@ -1,0 +1,66 @@
+#!/bin/bash
+#$ -N kamces_sliding
+#$ -S /bin/bash
+#$ -cwd
+#$ -V
+#$ -j y
+. "${KAMCES_LIB:-$(dirname "$0")/../lib}/common.sh"
+# O sliding.py chama a API Python do sourmash (import tardio) e escreve
+# Parquet: precisa dos dois ao mesmo tempo. A combinacao de modulos e
+# escolhida testando, nao adivinhando - ver lib/common.sh.
+kamces_require_python sourmash pyarrow
+set -euo pipefail
+
+kamces_banner "02 sliding window"
+# A LISTA DESTA TAREFA, e de onde ela vem.
+#
+# O `#$ -V` acima faz o qsub exportar TODO o ambiente de QUEM SUBMETEU. Quando
+# quem submete e o refazer.job, esse ambiente tem um MANIFEST proprio - o
+# manifesto IDEAL, com TUDO o que deveria existir - e ele pode vencer o
+# `-v MANIFEST=<lista de pendentes>` da linha de comando. O resultado e silencioso
+# e caro: o array tem o TAMANHO da lista de pendentes (-t 1-N) mas le as N
+# primeiras linhas do manifesto IDEAL. Refaz o que estava pronto, e nunca chega
+# ao fim da lista - foi assim que os ultimos cromossomos nunca rodaram.
+#
+# KAMCES_LISTA e um nome que o pai NAO tem, entao ele nao pode ser herdado por
+# acidente: quem o define e o -v de quem submeteu, e so ele. Tem prioridade.
+MANIFEST="${KAMCES_LISTA:-${MANIFEST:?MANIFEST nao definido}}"
+# E a confirmacao: quem submeteu diz quantas linhas a lista tinha. Se o numero
+# nao bater, esta tarefa esta lendo o arquivo errado - e melhor morrer dizendo
+# isso do que gravar um Parquet no lugar de outro.
+if [ -n "${KAMCES_LISTA_LINHAS:-}" ]; then
+    _nl=$(wc -l < "$MANIFEST" 2>/dev/null || echo 0); _nl="${_nl//[^0-9]/}"
+    [ "${_nl:-0}" = "$KAMCES_LISTA_LINHAS" ] || kamces_die \
+"lista errada: $MANIFEST tem ${_nl:-0} linha(s), e quem submeteu contou $KAMCES_LISTA_LINHAS.
+  Esta tarefa leria a linha $SGE_TASK_ID de um arquivo que nao e a lista dela."
+fi
+
+FASTA=$(kamces_param "$MANIFEST" 1)
+OUT=$(kamces_param   "$MANIFEST" 2)
+K=$(kamces_param     "$MANIFEST" 3)
+SC=$(kamces_param    "$MANIFEST" 4)
+# Campo 5: os ROTULOS de referencia deste conjunto (normal, uniformizado ou
+# valid). Vem resolvido do driver, congelado no instantaneo - o job nao
+# adivinha nem depende de o disco continuar igual quando a tarefa comecar.
+REFS=$(kamces_param_opt "$MANIFEST" 5)
+[ -n "$FASTA" ] || kamces_die "linha $SGE_TASK_ID vazia em $MANIFEST"
+
+echo " fasta : $FASTA"
+echo " saida : $OUT   (k=$K scaled=$SC)"
+[ -n "$REFS" ] && echo " refs  : ${REFS//,/ }"
+mkdir -p "$(dirname "$OUT")"
+
+ARGS=(--fasta "$FASTA" --reference-dir "$CATALOGS_DIR" --output "$OUT"
+      -w "$WINDOW_SIZE" -d "$STEP" -k "$K" --scaled "$SC"
+      --part-windows "$PART_WINDOWS" --compression "$COMPRESSION")
+[ -n "$REFS" ] && ARGS+=(--references "$REFS")
+
+# Retomada: se ja existe saida final ou partes, este job continua de onde parou.
+PARTS="${OUT}.parts"
+if [ -e "$OUT" ] || [ -d "$PARTS" ]; then
+    echo " retomando (saida ou partes ja existem)"
+    ARGS+=(--resume-log "$MANIFEST")
+fi
+
+python3 "$STAGES/sliding.py" "${ARGS[@]}"
+echo "fim: $(date '+%F %T')"

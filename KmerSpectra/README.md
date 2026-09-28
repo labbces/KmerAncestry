@@ -37,9 +37,10 @@ For that I need to define a lower and max for kmer depth/multiplicity. As lower 
 
 ```bash
 Logex -T10 \
-  'barberi_specific=barberi[9-102]-(spontaneum[10-]|.robustum[6-]|.officinarum[6-])' \
-  'spontaneum_specific=spontaneum[10-105]-(barberi[9-]|.robustum[6-]|.officinarum[6-])' \
-  'robustum_specific=robustum[6-45]-(barberi[9-]|.spontaneum[10-]|.officinarum[6-])' \
-  'officinarum_specific=officinarum[6-54]-(barberi[9-]|.spontaneum[10-]|.robustum[6-])' \
+  'barberi_specific=A[9-102]-(B[10-]|.C[6-]|.D[6-])' \
+  'spontaneum_specific=B[10-105]-(A[9-]|.C[6-]|.D[6-])' \
+  'robustum_specific=C[6-45]-(A[9-]|.B[10-]|.D[6-])' \
+  'officinarum_specific=D[6-54]-(A[9-]|.B[10-]|.C[6-])' \
   barberi spontaneum robustum officinarum
+
 ```

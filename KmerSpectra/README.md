@@ -22,6 +22,20 @@ I will use the kmer spectra plot to define the minum depth to consider kmers as 
 | *S. officinarum* | <img src="Figs/officinarum_kmerSpectra_weighted.png" alt="Weighted k-mer spectrum for S. officinarum" width="250"> | 12 | 18 |
 | *SP80-3280* | <img src="Figs/SP803280.19_kmerSpectra_weighted.png" alt="Weighted k-mer spectrum for SP80-3280" width="250"> | 13 | 30 |
 
+# Pairwise comparisons
+
+I will use KatComp from [Merqury.FK](https://github.com/thegenemyers/MERQURY.FK), to make pairwise comparisons between the kmer catalogs ([script](scripts/pairwise_comp.sh)). Using k=19. The goal here is to check whether there are species-specific kmers that could perhaps bring ancestry information.
+
+
+|  | *S. barberi* | *S. spontaneum* | *S. robustum* | *S. officinarum* | *SP80-3280* |
+| --- | --- | --- | --- | --- | --- |
+| *S. barberi* | | <img src="Figs/KatComp__barberi__vs__spontaneum.fi.png" width="250"> | <img src="Figs/KatComp__barberi__vs__robustum.fi.png" width="250"> | <img src="Figs/KatComp__barberi__vs__officinarum.fi.png" width="250"> | <img src="Figs/KatComp__barberi__vs__SP803280.fi.png" width="250">  |
+| *S. spontaneum* | <img src="Figs/KatComp__spontaneum__vs__barberi.fi.png" width="250"> | | <img src="Figs/KatComp__spontaneum__vs__robustum.fi.png" width="250"> | <img src="Figs/KatComp__spontaneum__vs__officinarum.fi.png" width="250"> | <img src="Figs/KatComp__spontaneum__vs__SP803280.fi.png" width="250">  |
+| *S. robustum* | <img src="Figs/KatComp__robustum__vs__barberi.fi.png" width="250"> | <img src="Figs/KatComp__robustum__vs__spontaneum.fi.png" width="250"> |  | <img src="Figs/KatComp__robustum__vs__officinarum.fi.png" width="250"> | <img src="Figs/KatComp__robustum__vs__SP803280.fi.png" width="250">  |
+| *S. officinarum* | <img src="Figs/KatComp__officinarum__vs__barberi.fi.png" width="250"> | <img src="Figs/KatComp__officinarum__vs__spontaneum.fi.png" width="250"> | <img src="Figs/KatComp__officinarum__vs__robustum.fi.png" width="250"> |  | <img src="Figs/KatComp__officinarum__vs__SP803280.fi.png" width="250">  | 
+| *SP80-3280* | <img src="Figs/KatComp__SP803280__vs__barberi.fi.png" width="250"> | <img src="Figs/KatComp__SP803280__vs__spontaneum.fi.png" width="250"> | <img src="Figs/KatComp__SP803280__vs__robustum.fi.png" width="250"> | <img src="Figs/KatComp__SP803280__vs__officinarum.fi.png" width="250"> |  | 
+
+
 # Species-specific kmer catalogs
 
 I will use Logex (part of FASTK) to generate species-specific catalogs, for the *Saccharum* ancestral species. In Logex I can perform set operations. So, for the set of species, A, B, C and D, in order to compute specific kmer for species A, I will computhe the union of kmers of species B, C and D, and then 'substract' A from that union set, and so on for each species.
@@ -33,6 +47,7 @@ For that I need to define a lower and max for kmer depth/multiplicity. As lower 
 | *S. spontanuem* | 35 | 10 | 105 |  |  |
 | *S. robustum* | 15 | 6 | 45 |  |
 | *S. officinarum* | 18 | 6 | 54 |  |  |
+| SP80-3280 | 30 | 10 | 90 |  |  |
 
 
 ```bash

@@ -1,8 +1,8 @@
 # FastK Kmer Spectra
 
-We are using [FastK](https://github.com/thegenemyers/FASTK) tro compute Kmer spectra, adn to find species-specific sets of kmers, which could be called anecestry informative kmers.
+We are using [FastK](https://github.com/thegenemyers/FASTK) to compute Kmer spectra, and to find species-specific sets of kmers, which could be called ancestry informative kmers.
 
-We will compute kmer spectra over the following data (Illumina paired end data, except SP80-3280 whihc is PacBio HiFi data):
+We will compute kmer spectra over the following data (Illumina paired end data, except SP80-3280 which is PacBio HiFi data):
 
 - [*Saccharum barberi*](data/barberi.srrs.txt)
 - [*Saccharum spontaneum*](data/spontaneum.srrs.txt)

@@ -32,6 +32,16 @@ In order to find solid kmers, i.e., kmers that are not error kmers,  I will defi
 | *S. officinarum* | 18 | 6 | 54 |  |  |
 | SP80-3280 | 30 | 10 | 90 |  |  |
 
+## Number of distinct kmers
+
+| Species | All Kmers | Solid kmers |
+| --- | --- | --- |
+| SP803280 | 5624082670 | 1360101864 | 
+| barberi | 16745629388 | 2150776376 |
+| officinarum | 16006484659 | 1983642132 |
+| robustum | 12294874483 | 2467341713 | 
+| spontaneum | 14868592554 | 2327170199 |
+
 # Pairwise comparisons
 
 We used KatComp from [Merqury.FK](https://github.com/thegenemyers/MERQURY.FK), to make pairwise comparisons between the kmer catalogs ([script](scripts/pairwise_comp.sh)). Using k=19. The goal here is to check whether there are species-specific kmers that could perhaps bring ancestry information.
